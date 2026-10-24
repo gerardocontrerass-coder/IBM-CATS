@@ -1,4 +1,4 @@
-# FEN PIURA V2
+# FEN PIURA V
 ## Documento maestro de caso, arquitectura, investigación y ejecución colaborativa
 
 **Versión:** 2.0 (prototipo experimental)  
