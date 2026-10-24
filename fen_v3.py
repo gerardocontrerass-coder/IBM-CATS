@@ -91,6 +91,8 @@ class Scenario:
     distance_source: str = "Haversine x1.3 (respaldo)"
     weather: dict = field(default_factory=dict)       # {punto: {lluvia_mm, mult, sigma, ...}}
     weather_source: str = "sin clima"
+    depot: tuple = DEPOT                # ("D0", lat, lon) del almacén
+    depot_name: str = "Almacén ficticio (Piura)"
 
 
 @dataclass(frozen=True)
@@ -99,7 +101,8 @@ class Route:
     drive: float; wait: float; return_at: float; load: int; reliability: float = 1.0
 
 
-def make_scenario(n: int = 8, seed: int = SEED) -> Scenario:
+def make_scenario(n: int = 8, seed: int = SEED, depot: Optional[tuple] = None,
+                  depot_name: Optional[str] = None) -> Scenario:
     """8 = caso heredado de V1; 10/25/50 añaden puntos sintéticos alrededor de los 8."""
     if n not in (8, 10, 25, 50):
         raise ValueError("Tamaños previstos: 8, 10, 25 o 50")
@@ -130,11 +133,15 @@ def make_scenario(n: int = 8, seed: int = SEED) -> Scenario:
     slots = [TripSlot(f"{veh.id}:T{j + 1}", veh.id, j, 360 + j * int(720 / trips), 360 + (j + 1) * int(720 / trips))
              for veh in v for j in range(trips)]
     detours = {tuple(sorted(k)): val for k, val in {("P5", "P6"): 3.0, ("D0", "P8"): 1.4}.items()}
-    return Scenario(f"Bajo Piura · {n} puntos", stops, {x.id: x for x in v}, slots, detours)
+    s = Scenario(f"Bajo Piura · {n} puntos", stops, {x.id: x for x in v}, slots, detours)
+    if depot is not None:
+        s.depot = ("D0", float(depot[0]), float(depot[1]))
+        s.depot_name = depot_name or f"Almacén ({depot[0]:.4f}, {depot[1]:.4f})"
+    return s
 
 
 def coords(s: Scenario, p: str) -> tuple:
-    return (DEPOT[1], DEPOT[2]) if p == "D0" else (s.stops[p].lat, s.stops[p].lon)
+    return (s.depot[1], s.depot[2]) if p == "D0" else (s.stops[p].lat, s.stops[p].lon)
 
 
 def node_ids(s: Scenario) -> list:
@@ -766,3 +773,68 @@ def export_json(path, s: Scenario, plan: list, metadata: Optional[dict] = None) 
             "metadata": metadata or {}}
     path.write_text(json.dumps(body, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     return path
+
+
+# ----------------------------------------------------------------------------
+# Localización del almacén
+# ----------------------------------------------------------------------------
+# Candidatos = centros urbanos aproximados del Bajo Piura (coordenadas a validar con
+# COER / municipalidades: buscar un local real con acceso pavimentado y fuera de zona inundable).
+DEPOT_CANDIDATES = [
+    ("Piura ciudad (actual)", -5.1945, -80.6328),
+    ("Castilla", -5.1985, -80.6170),
+    ("Catacaos", -5.2665, -80.6745),
+    ("La Arena", -5.3440, -80.7085),
+    ("La Unión", -5.4005, -80.7420),
+    ("Vice", -5.4185, -80.7760),
+    ("Sechura", -5.5575, -80.8215),
+]
+
+
+def demand_centroid(s: Scenario) -> tuple:
+    """Centro de gravedad de la demanda ponderado por paletas x prioridad (propuesta analítica)."""
+    w = np.array([x.demand * x.priority for x in s.stops.values()], float)
+    lat = float(np.average([x.lat for x in s.stops.values()], weights=w))
+    lon = float(np.average([x.lon for x in s.stops.values()], weights=w))
+    return lat, lon
+
+
+def evaluate_depots(n: int, candidates=None, weather_mode: Optional[str] = "fen2017",
+                    start_date: str = "2017-03-15", end_date: str = "2017-03-31", flood_mm: float = 30.0,
+                    min_reliability: float = 0.7, risk_weight: float = 60.0, use_osrm: bool = True,
+                    add_centroid: bool = True, time_limit: float = 20.0, river_flood=()) -> tuple:
+    """Evalúa cada ubicación candidata resolviendo el ruteo completo con ese almacén
+    (mismas carreteras, lluvia, flota y ventanas). Criterio, en orden:
+    1) almacén fuera de zona inundable (lluvia local o desborde de río marcado en river_flood), 2) menos albergues inalcanzables, 3) menor costo total.
+    Devuelve (tabla de filas, {nombre: escenario cargado})."""
+    candidates = list(candidates or DEPOT_CANDIDATES)
+    if add_centroid:
+        lat, lon = demand_centroid(make_scenario(n))
+        candidates.append(("Centro de demanda (propuesto)", lat, lon))
+    rows, scenarios = [], {}
+    for name, lat, lon in candidates:
+        s = make_scenario(n, depot=(lat, lon), depot_name=name)
+        if use_osrm:
+            s = load_osrm_distances(s); time.sleep(1.0)      # respeta el límite del servidor público
+        if weather_mode:
+            s = load_weather(s, weather_mode, start_date, end_date, flood_mm)
+        pool = route_pool(s, min_reliability=min_reliability, risk_weight=risk_weight)
+        out = unreachable(s, pool)
+        req = set(s.stops) - set(out)
+        res = solve_master(s, pool, time_limit, req)
+        rain = s.weather.get("D0", {}).get("lluvia_mm")
+        plan = res["routes"] if res["ok"] else []
+        rows.append({"candidato": name, "lat": round(lat, 4), "lon": round(lon, 4),
+                     "inalcanzables": len(out) if res["ok"] else len(s.stops),
+                     "costo total": round(res["obj"], 1) if res["ok"] else None,
+                     "km totales": summary(s, plan)["km"] if plan else None,
+                     "km medio a albergues": round(float(np.mean([km(s, "D0", p) for p in s.stops])), 1),
+                     "viajes usados": len(plan),
+                     "confiabilidad mín.": summary(s, plan)["confiabilidad_min"] if plan else None,
+                     "lluvia almacén mm": rain,
+                     "almacén inundable": bool((rain is not None and rain >= flood_mm) or name in set(river_flood)),
+                     "distancias": s.distance_source})
+        scenarios[name] = s
+    rows.sort(key=lambda r: (r["almacén inundable"], r["inalcanzables"],
+                             r["costo total"] if r["costo total"] is not None else math.inf))
+    return rows, scenarios
